@@ -118,11 +118,12 @@ def stamp(rows: list[dict], started_at: str) -> None:
 
 def sweep_deleted(db: sqlite_utils.Database, table: str, started_at: str) -> int:
     """Soft-delete rows we didn't see in this sync. Returns count newly marked."""
-    cur = db.execute(
-        f"UPDATE [{table}] SET deleted_at = ? "
-        "WHERE (last_synced_at IS NULL OR last_synced_at < ?) AND deleted_at IS NULL",
-        [started_at, started_at],
-    )
+    with db.conn:
+        cur = db.conn.execute(
+            f"UPDATE [{table}] SET deleted_at = ? "
+            "WHERE (last_synced_at IS NULL OR last_synced_at < ?) AND deleted_at IS NULL",
+            [started_at, started_at],
+        )
     return cur.rowcount
 
 
