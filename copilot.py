@@ -5,7 +5,8 @@
 # ///
 """Export Copilot Money data to a SQLite database.
 
-    uv run copilot.py [DB_PATH]   # default: copilot.db
+    uv run copilot.py [--db PATH] [--transactions-limit N]
+    uv run copilot.py --version
 
 Required env (in .env or the environment):
   FIREBASE_API_KEY        public web API key (?key=AIza…) from any *.googleapis.com request
@@ -14,17 +15,18 @@ Required env (in .env or the environment):
 A fresh 1h ID token is minted at startup; no manual re-paste needed unless
 the refresh token itself gets revoked.
 """
+import argparse
 import json
 import os
-import sys
 
 import httpx
 import sqlite_utils
 from dotenv import load_dotenv
 
+__version__ = "0.1.0"
+
 API_URL = "https://app.copilot.money/api/graphql"
 TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
-TRANSACTIONS_LIMIT: int | None = None
 
 
 def mint_id_token(refresh_token: str, api_key: str) -> str:
@@ -329,7 +331,7 @@ def sync_categories(cp: Copilot, db: sqlite_utils.Database) -> int:
     return len(rows)
 
 
-def sync_transactions(cp: Copilot, db: sqlite_utils.Database) -> int:
+def sync_transactions(cp: Copilot, db: sqlite_utils.Database, limit: int | None = None) -> int:
     after, total = None, 0
     while True:
         feed = cp.gql(GET_TRANSACTIONS, "TransactionsFeed", {"first": 200, "after": after})["feed"]
@@ -338,21 +340,38 @@ def sync_transactions(cp: Copilot, db: sqlite_utils.Database) -> int:
             db["transactions"].upsert_all(rows, pk="id", alter=True)
             total += len(rows)
         print(f"  transactions: {total}", flush=True)
-        if TRANSACTIONS_LIMIT is not None and total >= TRANSACTIONS_LIMIT:
+        if limit is not None and total >= limit:
             return total
         if not feed["pageInfo"]["hasNextPage"]:
             return total
         after = feed["pageInfo"]["endCursor"]
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="copilot",
+        description="Sync Copilot Money data into a local SQLite database.",
+    )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--db", default="copilot.db", help="path to the SQLite database (default: copilot.db)")
+    p.add_argument(
+        "--transactions-limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="stop after syncing at least N transactions (default: full sync)",
+    )
+    return p.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     load_dotenv()
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "copilot.db"
-    db = sqlite_utils.Database(db_path)
+    db = sqlite_utils.Database(args.db)
     with Copilot(os.environ["COPILOT_REFRESH_TOKEN"], os.environ["FIREBASE_API_KEY"]) as cp:
         print(f"accounts:     {sync_accounts(cp, db)}")
         print(f"categories:   {sync_categories(cp, db)}")
-        print(f"transactions: {sync_transactions(cp, db)}")
+        print(f"transactions: {sync_transactions(cp, db, limit=args.transactions_limit)}")
 
 
 if __name__ == "__main__":

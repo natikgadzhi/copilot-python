@@ -35,8 +35,10 @@ to manage.
 Sync everything into `copilot.db`:
 
 ```sh
-uv run copilot.py                  # defaults to ./copilot.db
-uv run copilot.py path/to/foo.db   # custom DB path
+uv run copilot.py                                # defaults to ./copilot.db
+uv run copilot.py --db path/to/foo.db            # custom DB path
+uv run copilot.py --transactions-limit 1000      # cap for fast iteration
+uv run copilot.py --version
 ```
 
 The transactions sync prints a running total after each page. A full sync of
