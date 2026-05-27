@@ -1,1 +1,23 @@
 .env
+
+*.db
+*.db.bak
+*.db-journal
+*.db-wal
+*.db-shm
+schema.json
+
+# Derivatives of the SQLite DB produced by export.py
+accounts.csv
+accounts.md
+categories.csv
+categories.md
+
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+.DS_Store
+.idea/
+.vscode/
