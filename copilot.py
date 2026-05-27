@@ -16,14 +16,27 @@ A fresh 1h ID token is minted at startup; no manual re-paste needed unless
 the refresh token itself gets revoked.
 """
 import argparse
+import hashlib
 import json
 import os
+from datetime import datetime, timezone
 
 import httpx
 import sqlite_utils
 from dotenv import load_dotenv
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+# Columns owned by this tool, never overwritten by remote upserts. local_notes
+# and local_updated_at are hand-edited; the rest are bookkeeping for sync.
+LOCAL_COLUMNS: dict[str, type] = {
+    "local_notes": str,
+    "local_updated_at": str,
+    "dirty": int,
+    "last_synced_at": str,
+    "remote_hash": str,
+    "deleted_at": str,
+}
 
 API_URL = "https://app.copilot.money/api/graphql"
 TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
@@ -81,6 +94,36 @@ def strip_typename(d: dict) -> dict:
 
 def flatten_category(c: dict, parent_id: str | None) -> dict:
     return {k: v for k, v in c.items() if k not in ("childCategories", "__typename")} | {"parent_id": parent_id}
+
+
+def ensure_local_columns(db: sqlite_utils.Database, table: str) -> None:
+    if not db[table].exists():
+        return
+    existing = set(db[table].columns_dict)
+    for col, ty in LOCAL_COLUMNS.items():
+        if col not in existing:
+            kwargs = {"not_null_default": 0} if col == "dirty" else {}
+            db[table].add_column(col, ty, **kwargs)
+
+
+def stamp(rows: list[dict], started_at: str) -> None:
+    """Annotate remote rows with a deterministic hash of their payload and the
+    sync timestamp. Both columns are part of the upsert so they update on
+    every sync; local-only columns are absent and therefore preserved."""
+    for r in rows:
+        payload = json.dumps(r, sort_keys=True, default=str).encode()
+        r["remote_hash"] = hashlib.md5(payload).hexdigest()
+        r["last_synced_at"] = started_at
+
+
+def sweep_deleted(db: sqlite_utils.Database, table: str, started_at: str) -> int:
+    """Soft-delete rows we didn't see in this sync. Returns count newly marked."""
+    cur = db.execute(
+        f"UPDATE [{table}] SET deleted_at = ? "
+        "WHERE (last_synced_at IS NULL OR last_synced_at < ?) AND deleted_at IS NULL",
+        [started_at, started_at],
+    )
+    return cur.rowcount
 
 
 GET_ACCOUNTS = """
@@ -315,29 +358,37 @@ fragment TransactionFields on Transaction {
 """
 
 
-def sync_accounts(cp: Copilot, db: sqlite_utils.Database) -> int:
+def sync_accounts(cp: Copilot, db: sqlite_utils.Database, started_at: str) -> int:
     rows = [strip_typename(a) for a in cp.gql(GET_ACCOUNTS, "Accounts")["accounts"]]
+    stamp(rows, started_at)
     db["accounts"].upsert_all(rows, pk="id", alter=True)
+    ensure_local_columns(db, "accounts")
     return len(rows)
 
 
-def sync_categories(cp: Copilot, db: sqlite_utils.Database) -> int:
+def sync_categories(cp: Copilot, db: sqlite_utils.Database, started_at: str) -> int:
     rows = []
     for parent in cp.gql(GET_CATEGORIES, "Categories")["categories"]:
         rows.append(flatten_category(parent, parent_id=None))
         for child in parent.get("childCategories") or []:
             rows.append(flatten_category(child, parent_id=parent["id"]))
+    stamp(rows, started_at)
     db["categories"].upsert_all(rows, pk="id", alter=True)
+    ensure_local_columns(db, "categories")
     return len(rows)
 
 
-def sync_transactions(cp: Copilot, db: sqlite_utils.Database, limit: int | None = None) -> int:
-    after, total = None, 0
+def sync_transactions(cp: Copilot, db: sqlite_utils.Database, started_at: str, limit: int | None = None) -> int:
+    after, total, ensured = None, 0, False
     while True:
         feed = cp.gql(GET_TRANSACTIONS, "TransactionsFeed", {"first": 200, "after": after})["feed"]
         rows = [strip_typename(e["node"]) for e in feed["edges"] if e["node"].get("__typename") == "Transaction"]
         if rows:
+            stamp(rows, started_at)
             db["transactions"].upsert_all(rows, pk="id", alter=True)
+            if not ensured:
+                ensure_local_columns(db, "transactions")
+                ensured = True
             total += len(rows)
         print(f"  transactions: {total}", flush=True)
         if limit is not None and total >= limit:
@@ -368,10 +419,20 @@ def main() -> None:
     args = parse_args()
     load_dotenv()
     db = sqlite_utils.Database(args.db)
+    started_at = datetime.now(timezone.utc).isoformat()
     with Copilot(os.environ["COPILOT_REFRESH_TOKEN"], os.environ["FIREBASE_API_KEY"]) as cp:
-        print(f"accounts:     {sync_accounts(cp, db)}")
-        print(f"categories:   {sync_categories(cp, db)}")
-        print(f"transactions: {sync_transactions(cp, db, limit=args.transactions_limit)}")
+        print(f"accounts:     {sync_accounts(cp, db, started_at)}")
+        print(f"categories:   {sync_categories(cp, db, started_at)}")
+        print(f"transactions: {sync_transactions(cp, db, started_at, limit=args.transactions_limit)}")
+    # Soft-delete rows the remote no longer returns. Transactions are skipped
+    # when --transactions-limit caps the sync — partial pulls would falsely
+    # flag the un-fetched tail as deleted.
+    print(f"soft-deleted: accounts={sweep_deleted(db, 'accounts', started_at)}, "
+          f"categories={sweep_deleted(db, 'categories', started_at)}", end="")
+    if args.transactions_limit is None:
+        print(f", transactions={sweep_deleted(db, 'transactions', started_at)}")
+    else:
+        print(" (transactions sweep skipped — partial sync)")
 
 
 if __name__ == "__main__":

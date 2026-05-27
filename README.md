@@ -72,6 +72,25 @@ Tables produced by `copilot.py`:
 Schema evolution is automatic: `sqlite_utils` adds columns as the GraphQL
 response grows.
 
+### Local columns (idempotent sync)
+
+Every synced table gets these tool-owned columns. They are never overwritten
+by re-syncing — only the columns present in the GraphQL response are touched
+on upsert.
+
+| Column             | Purpose                                                              |
+| ------------------ | -------------------------------------------------------------------- |
+| `local_notes`      | Free-form annotations you write locally.                             |
+| `local_updated_at` | When you last edited a local field.                                  |
+| `dirty`            | `1` when local edits are pending push back to Copilot (future work). |
+| `last_synced_at`   | Set every sync, on every row the remote returned.                    |
+| `remote_hash`      | MD5 of the remote payload — for detecting remote changes.            |
+| `deleted_at`       | Set when a row is no longer returned by the remote (soft delete).    |
+
+`deleted_at` is set during the post-sync sweep. For transactions, the sweep
+only runs on a full sync — `--transactions-limit` skips it to avoid falsely
+marking the un-fetched tail as deleted.
+
 ## License
 
 [MIT](./LICENSE)

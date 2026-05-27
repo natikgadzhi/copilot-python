@@ -18,10 +18,12 @@ are gitignored.
 
     uv run export.py [DB_PATH] [OUT_DIR]   # defaults: copilot.db, .
 """
+import argparse
 import csv
 import sqlite3
-import sys
 from pathlib import Path
+
+__version__ = "0.2.0"
 
 ACCOUNT_COLS = ["name", "type", "subType", "mask", "balance", "limit", "institutionId", "isManual", "id"]
 
@@ -86,11 +88,22 @@ def dump_categories(conn: sqlite3.Connection, out_dir: Path) -> int:
     return len(by_id)
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="copilot-export",
+        description="Export open accounts and all categories from the SQLite DB to CSV + Markdown.",
+    )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--db", default="copilot.db", help="path to the SQLite database (default: copilot.db)")
+    p.add_argument("--out", default=".", help="output directory (default: .)")
+    return p.parse_args()
+
+
 def main() -> None:
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "copilot.db"
-    out_dir = Path(sys.argv[2] if len(sys.argv) > 2 else ".")
+    args = parse_args()
+    out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(args.db)
     try:
         print(f"accounts:   {dump_accounts(conn, out_dir)} -> accounts.csv, accounts.md")
         print(f"categories: {dump_categories(conn, out_dir)} -> categories.csv, categories.md")
