@@ -376,6 +376,26 @@ def test_collect_stats_latest_transaction(db):
     assert s["latest_transaction"]["created_at"].startswith("20")  # rendered UTC timestamp
 
 
+def test_collect_stats_latest_transaction_includes_name_category_description(db):
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
+    _seed(db, [
+        {"id": "t1", "date": "2026-05-01", "name": "Old", "categoryId": "c1", "userNotes": "older"},
+        {"id": "t2", "date": "2026-05-29", "name": "Whole Foods", "categoryId": "c1", "userNotes": "weekly shop"},
+    ], table="transactions")
+    lt = copilot.collect_stats(db)["latest_transaction"]
+    assert lt["name"] == "Whole Foods"
+    assert lt["category"] == "Groceries"      # resolved from categoryId
+    assert lt["description"] == "weekly shop"
+
+
+def test_collect_stats_latest_transaction_optional_fields_default_none(db):
+    _seed(db, [{"id": "t1", "date": "2026-05-29", "name": "Solo"}], table="transactions")
+    lt = copilot.collect_stats(db)["latest_transaction"]
+    assert lt["name"] == "Solo"
+    assert lt["category"] is None      # no categoryId column / value
+    assert lt["description"] is None   # no userNotes
+
+
 def test_collect_stats_latest_transaction_excludes_deleted(db):
     _seed(db, [{"id": "t1", "date": "2026-05-01"}, {"id": "t2", "date": "2026-05-29"}], table="transactions")
     db["transactions"].update("t2", {"deleted_at": "2026-05-30T00:00:00Z"})
@@ -429,12 +449,15 @@ def test_cli_help_lists_all_subcommands():
 def test_stats_command_runs(tmp_path):
     dbpath = tmp_path / "c.db"
     sdb = sqlite_utils.Database(dbpath)
-    _seed(sdb, [{"id": "t1", "date": "2026-05-29", "createdAt": 1780179278677}], table="transactions")
+    _seed(sdb, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
+    _seed(sdb, [{"id": "t1", "date": "2026-05-29", "createdAt": 1780179278677,
+                 "name": "Whole Foods", "categoryId": "c1", "userNotes": "weekly shop"}], table="transactions")
     sdb.conn.close()
     result = runner.invoke(copilot.app, ["stats", "--db", str(dbpath)])
     assert result.exit_code == 0
     out = _output(result)
-    assert "transactions" in out and "2026-05-29" in out
+    for token in ("transactions", "2026-05-29", "Whole Foods", "Groceries", "weekly shop"):
+        assert token in out, f"{token!r} missing from stats output"
 
 
 def test_update_command_requires_a_field(tmp_path):

@@ -3,16 +3,13 @@
 ## Unreleased
 
 ### Added
-- `stats` command — per-table live / soft-deleted / dirty row counts, the latest
-  transaction (date + `createdAt`), and the last sync time.
+- `stats` command — `rich` tables showing per-table live / soft-deleted / dirty
+  row counts and the latest transaction (date, createdAt, name, category,
+  description), plus the last sync time.
 - `sync --incremental` — newest-first catch-up that stops at the first
   already-synced transaction; skips the transactions soft-delete sweep. Catches
   **new** transactions only (no `updatedAt` exists to detect edits); full `sync`
-  remains the catch-all.
-
-### Notes
-- `TRANSACTION_SORT` (the newest-first sort for `--incremental`) is a placeholder
-  pending a captured `transactionsFeed` sort; the logic is unit-tested regardless.
+  remains the catch-all. Newest-first sort confirmed from a captured feed.
 
 ## 0.3.0 — 2026-05-30
 

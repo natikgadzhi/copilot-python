@@ -59,10 +59,6 @@ known one — run a plain `sync` for those. (Accounts and categories always sync
 fully; `--incremental` only changes the transactions phase, and skips the
 transactions soft-delete sweep like `--transactions-limit` does.)
 
-> **Note:** the newest-first `$sort` value (`TRANSACTION_SORT` in `copilot.py`)
-> is a best-guess placeholder until captured from a sorted `transactionsFeed`
-> request — see [Re-capturing the API operations](#re-capturing-the-api-operations).
-
 ### Inspecting the local DB
 
 ```sh

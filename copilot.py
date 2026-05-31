@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["httpx", "sqlite-utils", "python-dotenv", "typer"]
+# dependencies = ["httpx", "sqlite-utils", "python-dotenv", "typer", "rich"]
 # ///
 """Copilot Money CLI: sync data into SQLite, write transaction edits back, and
 export annotation-friendly summaries.
@@ -30,6 +30,9 @@ import httpx
 import sqlite_utils
 import typer
 from dotenv import load_dotenv
+from rich import box
+from rich.console import Console
+from rich.table import Table
 
 __version__ = "0.3.0"
 
@@ -460,10 +463,9 @@ EDIT_TRANSACTION_OP = "EditTransaction"
 EDIT_TRANSACTION_FIELD = "editTransaction"
 
 # Sort sent with `sync --incremental` to force a newest-first feed so the
-# "stop at the first already-synced transaction" early-exit is sound.
-# TODO(capture): confirm the real TransactionSort shape from a sorted
-# transactionsFeed request in DevTools and replace this best guess.
-TRANSACTION_SORT = [{"field": "DATE", "order": "DESCENDING"}]
+# "stop at the first already-synced transaction" early-exit is sound. Shape
+# confirmed from a captured transactionsFeed request (DESC = newest first).
+TRANSACTION_SORT = [{"direction": "DESC", "field": "DATE"}]
 
 
 def update_transaction(
@@ -679,14 +681,21 @@ def collect_stats(db: sqlite_utils.Database) -> dict:
     if db["transactions"].exists():
         cols = set(db["transactions"].columns_dict)
         where = "where deleted_at is null" if "deleted_at" in cols else ""
-        date = next(db.query(f"select max(date) d from transactions {where}"))["d"]
-        if date is not None:
-            created = None
-            if "createdAt" in cols:
-                row = next(db.query(
-                    f"select createdAt from transactions {where} order by date desc, createdAt desc limit 1"))
-                created = _format_created_at(row["createdAt"])
-            latest = {"date": date, "created_at": created}
+        order = "order by date desc" + (", createdAt desc" if "createdAt" in cols else "")
+        rows = list(db.query(f"select * from transactions {where} {order} limit 1"))
+        if rows:
+            r = rows[0]
+            category = None
+            if r.get("categoryId") and db["categories"].exists():
+                cat = list(db["categories"].rows_where("id = ?", [r["categoryId"]]))
+                category = cat[0]["name"] if cat else None
+            latest = {
+                "date": r["date"],
+                "created_at": _format_created_at(r.get("createdAt")),
+                "name": r.get("name"),
+                "category": category,
+                "description": r.get("userNotes"),
+            }
 
     return {"tables": tables, "latest_transaction": latest, "last_synced_at": max(synced) if synced else None}
 
@@ -800,12 +809,33 @@ def export(
 def stats(db: str = typer.Option("copilot.db", help="Path to the SQLite database.")) -> None:
     """Show row counts, the latest transaction, and the last sync time."""
     s = collect_stats(sqlite_utils.Database(db))
+    console = Console()
+
+    counts = Table(title="Local database", box=box.SIMPLE_HEAVY, title_justify="left")
+    counts.add_column("table")
+    counts.add_column("live", justify="right")
+    counts.add_column("deleted", justify="right")
+    counts.add_column("dirty", justify="right")
     for name in STATS_TABLES:
         c = s["tables"][name]
-        typer.echo(f"{name:<13} live={c['live']:<7} deleted={c['deleted']:<5} dirty={c['dirty']}")
+        counts.add_row(name, str(c["live"]), str(c["deleted"]), str(c["dirty"]))
+    console.print(counts)
+
     lt = s["latest_transaction"]
-    typer.echo(f"latest txn:   {lt['date']}  (createdAt {lt['created_at']})" if lt else "latest txn:   —")
-    typer.echo(f"last synced:  {s['last_synced_at'] or '—'}")
+    latest = Table(title="Latest transaction", box=box.SIMPLE_HEAVY, title_justify="left", show_header=False)
+    latest.add_column("field", style="bold")
+    latest.add_column("value")
+    if lt:
+        latest.add_row("date", lt["date"])
+        latest.add_row("created", lt["created_at"] or "—")
+        latest.add_row("name", lt["name"] or "—")
+        latest.add_row("category", lt["category"] or "—")
+        latest.add_row("description", lt["description"] or "—")
+    else:
+        latest.add_row("—", "no transactions yet")
+    console.print(latest)
+
+    console.print(f"[bold]last synced:[/bold] {s['last_synced_at'] or '—'}")
 
 
 if __name__ == "__main__":
