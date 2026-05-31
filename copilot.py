@@ -459,6 +459,12 @@ fragment TransactionFields on Transaction {
 EDIT_TRANSACTION_OP = "EditTransaction"
 EDIT_TRANSACTION_FIELD = "editTransaction"
 
+# Sort sent with `sync --incremental` to force a newest-first feed so the
+# "stop at the first already-synced transaction" early-exit is sound.
+# TODO(capture): confirm the real TransactionSort shape from a sorted
+# transactionsFeed request in DevTools and replace this best guess.
+TRANSACTION_SORT = [{"field": "DATE", "order": "DESCENDING"}]
+
 
 def update_transaction(
     db: sqlite_utils.Database,
@@ -527,11 +533,33 @@ def sync_categories(cp: Copilot, db: sqlite_utils.Database, started_at: str) -> 
     return len(rows)
 
 
-def sync_transactions(cp: Copilot, db: sqlite_utils.Database, started_at: str, limit: int | None = None) -> int:
+def sync_transactions(
+    cp: Copilot,
+    db: sqlite_utils.Database,
+    started_at: str,
+    limit: int | None = None,
+    incremental: bool = False,
+) -> int:
+    """Sync the transactions feed into SQLite, returning the number of rows
+    written. With ``incremental=True`` the feed is requested newest-first and
+    the sync stops at the first page that contains an already-synced
+    transaction — fast catch-up on new transactions. It will NOT pick up edits
+    to already-synced transactions or backdated inserts; a full sync does."""
+    known: set[str] = set()
+    if incremental and db["transactions"].exists():
+        known = {r["id"] for r in db["transactions"].rows_where(select="id")}
+
     after, total, ensured = None, 0, False
     while True:
-        feed = cp.gql(GET_TRANSACTIONS, "TransactionsFeed", {"first": 200, "after": after})["feed"]
-        rows = [strip_typename(e["node"]) for e in feed["edges"] if e["node"].get("__typename") == "Transaction"]
+        variables = {"first": 200, "after": after}
+        if incremental:
+            variables["sort"] = TRANSACTION_SORT
+        feed = cp.gql(GET_TRANSACTIONS, "TransactionsFeed", variables)["feed"]
+        page = [strip_typename(e["node"]) for e in feed["edges"] if e["node"].get("__typename") == "Transaction"]
+
+        rows = [r for r in page if r["id"] not in known] if incremental else page
+        caught_up = incremental and len(rows) < len(page)  # saw an already-synced transaction
+
         if rows:
             stamp(rows, started_at)
             db["transactions"].upsert_all(rows, pk="id", alter=True)
@@ -540,6 +568,9 @@ def sync_transactions(cp: Copilot, db: sqlite_utils.Database, started_at: str, l
                 ensured = True
             total += len(rows)
         print(f"  transactions: {total}", flush=True)
+
+        if caught_up:
+            return total
         if limit is not None and total >= limit:
             return total
         if not feed["pageInfo"]["hasNextPage"]:
@@ -612,6 +643,54 @@ def dump_categories(conn: sqlite3.Connection, out_dir: Path) -> int:
     return len(by_id)
 
 
+# --- stats ------------------------------------------------------------------
+
+STATS_TABLES = ("accounts", "categories", "transactions")
+
+
+def _format_created_at(ms: int | None) -> str | None:
+    """Render a Copilot epoch-millisecond `createdAt` as a UTC ISO timestamp."""
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+
+def collect_stats(db: sqlite_utils.Database) -> dict:
+    """Summarize the local DB: per-table live/deleted/dirty counts, the latest
+    (non-deleted) transaction, and the most recent sync time across tables."""
+    tables, synced = {}, []
+    for name in STATS_TABLES:
+        t = db[name]
+        if not t.exists():
+            tables[name] = {"live": 0, "deleted": 0, "dirty": 0}
+            continue
+        cols = set(t.columns_dict)
+        tables[name] = {
+            "live": t.count_where("deleted_at is null") if "deleted_at" in cols else t.count,
+            "deleted": t.count_where("deleted_at is not null") if "deleted_at" in cols else 0,
+            "dirty": t.count_where("dirty = 1") if "dirty" in cols else 0,
+        }
+        if "last_synced_at" in cols:
+            m = next(db.query(f"select max(last_synced_at) m from [{name}]"))["m"]
+            if m:
+                synced.append(m)
+
+    latest = None
+    if db["transactions"].exists():
+        cols = set(db["transactions"].columns_dict)
+        where = "where deleted_at is null" if "deleted_at" in cols else ""
+        date = next(db.query(f"select max(date) d from transactions {where}"))["d"]
+        if date is not None:
+            created = None
+            if "createdAt" in cols:
+                row = next(db.query(
+                    f"select createdAt from transactions {where} order by date desc, createdAt desc limit 1"))
+                created = _format_created_at(row["createdAt"])
+            latest = {"date": date, "created_at": created}
+
+    return {"tables": tables, "latest_transaction": latest, "last_synced_at": max(synced) if synced else None}
+
+
 # --- CLI (Typer) ------------------------------------------------------------
 
 app = typer.Typer(
@@ -647,6 +726,11 @@ def sync(
         None, "--transactions-limit", metavar="N",
         help="Stop after syncing at least N transactions (default: full sync).",
     ),
+    incremental: bool = typer.Option(
+        False, "--incremental",
+        help="Fast catch-up: sync newest transactions first and stop at the first "
+             "already-synced one. Misses edits/backdated inserts — use a full sync for those.",
+    ),
 ) -> None:
     """Sync accounts, categories, and the transactions feed into SQLite."""
     load_dotenv()
@@ -655,13 +739,14 @@ def sync(
     with _client() as cp:
         print(f"accounts:     {sync_accounts(cp, database, started_at)}")
         print(f"categories:   {sync_categories(cp, database, started_at)}")
-        print(f"transactions: {sync_transactions(cp, database, started_at, limit=transactions_limit)}")
-    # Soft-delete rows the remote no longer returns. Transactions are skipped
-    # when --transactions-limit caps the sync — partial pulls would falsely
-    # flag the un-fetched tail as deleted.
+        print(f"transactions: {sync_transactions(cp, database, started_at, limit=transactions_limit, incremental=incremental)}")
+    # Soft-delete rows the remote no longer returns. Accounts/categories always
+    # sync fully, so they're always swept. The transactions sweep is skipped on
+    # any partial pull (--transactions-limit or --incremental) — we deliberately
+    # didn't fetch the tail, so sweeping would falsely flag it as deleted.
     print(f"soft-deleted: accounts={sweep_deleted(database, 'accounts', started_at)}, "
           f"categories={sweep_deleted(database, 'categories', started_at)}", end="")
-    if transactions_limit is None:
+    if transactions_limit is None and not incremental:
         print(f", transactions={sweep_deleted(database, 'transactions', started_at)}")
     else:
         print(" (transactions sweep skipped — partial sync)")
@@ -709,6 +794,18 @@ def export(
         typer.echo(f"categories: {dump_categories(conn, out_dir)} -> categories.csv, categories.md")
     finally:
         conn.close()
+
+
+@app.command()
+def stats(db: str = typer.Option("copilot.db", help="Path to the SQLite database.")) -> None:
+    """Show row counts, the latest transaction, and the last sync time."""
+    s = collect_stats(sqlite_utils.Database(db))
+    for name in STATS_TABLES:
+        c = s["tables"][name]
+        typer.echo(f"{name:<13} live={c['live']:<7} deleted={c['deleted']:<5} dirty={c['dirty']}")
+    lt = s["latest_transaction"]
+    typer.echo(f"latest txn:   {lt['date']}  (createdAt {lt['created_at']})" if lt else "latest txn:   —")
+    typer.echo(f"last synced:  {s['last_synced_at'] or '—'}")
 
 
 if __name__ == "__main__":

@@ -290,6 +290,113 @@ def test_update_transaction_patches_local_row_from_response(db):
     assert row["last_synced_at"] is not None
 
 
+# --- sync_transactions (full + incremental) ---------------------------------
+
+def _feed(txns, has_next, cursor="cur"):
+    return {"feed": {
+        "edges": [{"cursor": "c", "node": {**t, "__typename": "Transaction"}, "__typename": "TransactionEdge"} for t in txns],
+        "pageInfo": {"endCursor": cursor, "hasNextPage": has_next, "hasPreviousPage": False,
+                     "startCursor": "s", "__typename": "PageInfo"},
+        "__typename": "Conn",
+    }}
+
+
+def test_sync_transactions_full_paginates_all_pages(db):
+    cp = MagicMock()
+    cp.gql.side_effect = [
+        _feed([{"id": "t1", "date": "2026-05-03"}, {"id": "t2", "date": "2026-05-02"}], has_next=True),
+        _feed([{"id": "t3", "date": "2026-05-01"}], has_next=False),
+    ]
+    total = copilot.sync_transactions(cp, db, "2026-05-30T00:00:00Z")
+    assert total == 3
+    assert cp.gql.call_count == 2
+    assert {r["id"] for r in db["transactions"].rows} == {"t1", "t2", "t3"}
+
+
+def test_sync_transactions_incremental_stops_at_known_transaction(db):
+    _seed(db, [{"id": "t_old", "date": "2026-05-01"}], table="transactions", at="2026-05-20T00:00:00Z")
+    cp = MagicMock()
+    cp.gql.side_effect = [
+        # newest-first: a new one, then the already-synced one on the same page
+        _feed([{"id": "t_new", "date": "2026-05-29"}, {"id": "t_old", "date": "2026-05-01"}], has_next=True),
+        _feed([{"id": "t_older", "date": "2026-04-01"}], has_next=False),  # must NOT be fetched
+    ]
+    total = copilot.sync_transactions(cp, db, "2026-05-30T00:00:00Z", incremental=True)
+    assert total == 1                      # only t_new is new
+    assert cp.gql.call_count == 1          # stopped after the page bearing the known id
+    assert db["transactions"].count == 2   # t_old + t_new, t_older never fetched
+
+
+def test_sync_transactions_incremental_sends_sort_variable(db):
+    cp = MagicMock()
+    cp.gql.side_effect = [_feed([{"id": "t1", "date": "2026-05-01"}], has_next=False)]
+    copilot.sync_transactions(cp, db, "2026-05-30T00:00:00Z", incremental=True)
+    variables = cp.gql.call_args.args[2]
+    assert variables.get("sort") == copilot.TRANSACTION_SORT
+
+
+def test_sync_transactions_incremental_on_empty_db_syncs_all(db):
+    cp = MagicMock()
+    cp.gql.side_effect = [
+        _feed([{"id": "t1", "date": "2026-05-02"}], has_next=True),
+        _feed([{"id": "t2", "date": "2026-05-01"}], has_next=False),
+    ]
+    total = copilot.sync_transactions(cp, db, "2026-05-30T00:00:00Z", incremental=True)
+    assert total == 2                      # nothing known yet -> full pass, no early stop
+    assert cp.gql.call_count == 2
+
+
+# --- collect_stats ----------------------------------------------------------
+
+def test_format_created_at_epoch_ms_to_utc():
+    assert copilot._format_created_at(0) == "1970-01-01T00:00:00+00:00"
+
+
+def test_format_created_at_none():
+    assert copilot._format_created_at(None) is None
+
+
+def test_collect_stats_counts_live_deleted_dirty(db):
+    _seed(db, [{"id": "a1"}, {"id": "a2"}, {"id": "a3"}], table="accounts")
+    db["accounts"].update("a2", {"deleted_at": "2026-05-30T00:00:00Z"})
+    db["accounts"].update("a3", {"dirty": 1})
+    s = copilot.collect_stats(db)
+    assert s["tables"]["accounts"]["live"] == 2     # a1, a3
+    assert s["tables"]["accounts"]["deleted"] == 1  # a2
+    assert s["tables"]["accounts"]["dirty"] == 1    # a3
+
+
+def test_collect_stats_latest_transaction(db):
+    _seed(db, [
+        {"id": "t1", "date": "2026-05-01", "createdAt": 1700000000000},
+        {"id": "t2", "date": "2026-05-29", "createdAt": 1780179278677},
+    ], table="transactions")
+    s = copilot.collect_stats(db)
+    assert s["latest_transaction"]["date"] == "2026-05-29"
+    assert s["latest_transaction"]["created_at"].startswith("20")  # rendered UTC timestamp
+
+
+def test_collect_stats_latest_transaction_excludes_deleted(db):
+    _seed(db, [{"id": "t1", "date": "2026-05-01"}, {"id": "t2", "date": "2026-05-29"}], table="transactions")
+    db["transactions"].update("t2", {"deleted_at": "2026-05-30T00:00:00Z"})
+    s = copilot.collect_stats(db)
+    assert s["latest_transaction"]["date"] == "2026-05-01"
+
+
+def test_collect_stats_last_synced_at_is_max_across_tables(db):
+    _seed(db, [{"id": "a1"}], table="accounts", at="2026-05-30T01:00:00Z")
+    _seed(db, [{"id": "t1", "date": "2026-05-01"}], table="transactions", at="2026-05-30T03:00:00Z")
+    s = copilot.collect_stats(db)
+    assert s["last_synced_at"] == "2026-05-30T03:00:00Z"
+
+
+def test_collect_stats_handles_missing_tables(db):
+    s = copilot.collect_stats(db)  # empty DB, no tables
+    assert s["tables"]["transactions"] == {"live": 0, "deleted": 0, "dirty": 0}
+    assert s["latest_transaction"] is None
+    assert s["last_synced_at"] is None
+
+
 # --- CLI (Typer) ------------------------------------------------------------
 
 runner = CliRunner()
@@ -315,8 +422,19 @@ def test_cli_help_lists_all_subcommands():
     result = runner.invoke(copilot.app, ["--help"])
     assert result.exit_code == 0
     out = _output(result)
-    for cmd in ("sync", "update", "export"):
+    for cmd in ("sync", "update", "export", "stats"):
         assert cmd in out
+
+
+def test_stats_command_runs(tmp_path):
+    dbpath = tmp_path / "c.db"
+    sdb = sqlite_utils.Database(dbpath)
+    _seed(sdb, [{"id": "t1", "date": "2026-05-29", "createdAt": 1780179278677}], table="transactions")
+    sdb.conn.close()
+    result = runner.invoke(copilot.app, ["stats", "--db", str(dbpath)])
+    assert result.exit_code == 0
+    out = _output(result)
+    assert "transactions" in out and "2026-05-29" in out
 
 
 def test_update_command_requires_a_field(tmp_path):

@@ -8,13 +8,14 @@ CSV/Markdown summaries of accounts and categories for annotation.
 
 `copilot.py` is a single [uv](https://docs.astral.sh/uv/) script (inline
 [PEP 723](https://peps.python.org/pep-0723/) dependency metadata — no virtualenv
-to manage) with three subcommands:
+to manage) with these subcommands:
 
 | Command  | Purpose                                                                  |
 | -------- | ------------------------------------------------------------------------ |
-| `sync`   | Sync accounts, categories, and the full transactions feed into SQLite.   |
+| `sync`   | Sync accounts, categories, and the transactions feed into SQLite (`--incremental` for fast catch-up). |
 | `update` | Push a name / category / description change for one transaction back to Copilot. |
 | `export` | Read the SQLite DB and emit `accounts.{csv,md}` + `categories.{csv,md}`.  |
+| `stats`  | Print row counts, the latest transaction, and the last sync time.        |
 
 ## Setup
 
@@ -39,6 +40,7 @@ Sync everything into `copilot.db`:
 uv run copilot.py sync                           # defaults to ./copilot.db
 uv run copilot.py sync --db path/to/foo.db       # custom DB path
 uv run copilot.py sync --transactions-limit 1000 # cap for fast iteration
+uv run copilot.py sync --incremental             # fast catch-up (see below)
 uv run copilot.py --version
 ```
 
@@ -46,6 +48,30 @@ The transactions sync prints a running total after each page. A full sync of
 tens of thousands of transactions takes a few minutes — the GraphQL feed
 interleaves `Transaction` and `TransactionMonth` divider nodes, so each
 200-edge page typically contains ~25 actual transactions.
+
+**`--incremental`** requests the feed newest-first and stops at the first page
+containing a transaction you've already synced — so a routine catch-up only
+pulls the latest few pages instead of the whole history. The trade-off: because
+Copilot exposes no per-transaction "last modified" timestamp, incremental only
+catches **new** transactions. It will **not** pick up edits/recategorizations to
+already-synced transactions, or backdated inserts that land below the newest
+known one — run a plain `sync` for those. (Accounts and categories always sync
+fully; `--incremental` only changes the transactions phase, and skips the
+transactions soft-delete sweep like `--transactions-limit` does.)
+
+> **Note:** the newest-first `$sort` value (`TRANSACTION_SORT` in `copilot.py`)
+> is a best-guess placeholder until captured from a sorted `transactionsFeed`
+> request — see [Re-capturing the API operations](#re-capturing-the-api-operations).
+
+### Inspecting the local DB
+
+```sh
+uv run copilot.py stats
+```
+
+Prints per-table live / soft-deleted / dirty row counts, the most recent
+transaction (date + `createdAt` as a UTC timestamp), and when the DB was last
+synced — a quick "how current is my data?" check.
 
 ### Updating transactions
 
@@ -111,8 +137,8 @@ on upsert.
 | `deleted_at`       | Set when a row is no longer returned by the remote (soft delete).    |
 
 `deleted_at` is set during the post-sync sweep. For transactions, the sweep
-only runs on a full sync — `--transactions-limit` skips it to avoid falsely
-marking the un-fetched tail as deleted.
+only runs on a full sync — `--transactions-limit` and `--incremental` skip it to
+avoid falsely marking the un-fetched tail as deleted.
 
 ## Re-capturing the API operations
 
@@ -140,9 +166,10 @@ uv run test_copilot.py
 
 Covers the DB helpers (idempotent upsert, `stamp`, `ensure_local_columns`,
 `sweep_deleted`), category-name resolution, the `update_transaction` worker
-(field mapping, guards, local patch — GraphQL client mocked), and Typer CLI
-wiring (`--version`, subcommands, the `update` no-field guard). No network — the
-live GraphQL calls are not exercised.
+(field mapping, guards, local patch), full + incremental `sync_transactions`
+(paging and the stop-at-known-transaction early exit), `collect_stats`, and
+Typer CLI wiring (`--version`, subcommands, the `update` no-field guard). The
+GraphQL client is mocked throughout — no network, no live calls.
 
 ## License
 
