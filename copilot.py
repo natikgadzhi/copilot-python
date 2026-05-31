@@ -76,9 +76,7 @@ class Copilot:
         self._refresh()
 
     def _refresh(self) -> None:
-        self.client.headers["authorization"] = (
-            f"Bearer {mint_id_token(self.refresh_token, self.api_key)}"
-        )
+        self.client.headers["authorization"] = f"Bearer {mint_id_token(self.refresh_token, self.api_key)}"
 
     def gql(self, query: str, op: str, variables: dict | None = None) -> dict:
         payload = {"query": query, "variables": variables or {}, "operationName": op}
@@ -89,9 +87,7 @@ class Copilot:
                 continue
             body = r.json()
             if r.status_code >= 400 or body.get("errors"):
-                raise RuntimeError(
-                    f"{op} HTTP {r.status_code}: {json.dumps(body, indent=2)}"
-                )
+                raise RuntimeError(f"{op} HTTP {r.status_code}: {json.dumps(body, indent=2)}")
             return body["data"]
         raise RuntimeError(f"{op}: still unauthorized after token refresh")
 
@@ -107,9 +103,7 @@ def strip_typename(d: dict) -> dict:
 
 
 def flatten_category(c: dict, parent_id: str | None) -> dict:
-    return {
-        k: v for k, v in c.items() if k not in ("childCategories", "__typename")
-    } | {"parent_id": parent_id}
+    return {k: v for k, v in c.items() if k not in ("childCategories", "__typename")} | {"parent_id": parent_id}
 
 
 def ensure_local_columns(db: sqlite_utils.Database, table: str) -> None:
@@ -152,18 +146,12 @@ def resolve_category(db: sqlite_utils.Database, name: str) -> str:
 
     Raises CategoryError if no live category matches, or if the name is
     ambiguous (listing the candidate ids so the caller can disambiguate)."""
-    matches = list(
-        db["categories"].rows_where("name = ? AND deleted_at IS NULL", [name])
-    )
+    matches = list(db["categories"].rows_where("name = ? AND deleted_at IS NULL", [name]))
     if not matches:
-        raise CategoryError(
-            f"No category named {name!r}. Run `sync` first or check the spelling."
-        )
+        raise CategoryError(f"No category named {name!r}. Run `sync` first or check the spelling.")
     if len(matches) > 1:
         candidates = ", ".join(f"{m['id']} (parent={m['parent_id']})" for m in matches)
-        raise CategoryError(
-            f"Category name {name!r} is ambiguous; matches: {candidates}."
-        )
+        raise CategoryError(f"Category name {name!r} is ambiguous; matches: {candidates}.")
     return matches[0]["id"]
 
 
@@ -497,22 +485,16 @@ def update_transaction(
     no field is given or the transaction isn't present locally, and
     CategoryError when ``category`` can't be resolved to a single category."""
     if name is None and category is None and description is None:
-        raise ValueError(
-            "Nothing to update: pass at least one of name / category / description."
-        )
+        raise ValueError("Nothing to update: pass at least one of name / category / description.")
 
     if not db["transactions"].exists():
         raise ValueError("No transactions table in the DB — run `sync` first.")
     try:
         existing = db["transactions"].get(txn_id)
     except sqlite_utils.db.NotFoundError:
-        raise ValueError(
-            f"No transaction with id {txn_id!r} in the local DB — run `sync` first or check the id."
-        )
+        raise ValueError(f"No transaction with id {txn_id!r} in the local DB — run `sync` first or check the id.")
     if existing.get("deleted_at") is not None:
-        raise ValueError(
-            f"Transaction {txn_id!r} is soft-deleted locally; refusing to update."
-        )
+        raise ValueError(f"Transaction {txn_id!r} is soft-deleted locally; refusing to update.")
 
     fields: dict = {}
     if name is not None:
@@ -580,16 +562,10 @@ def sync_transactions(
         if incremental:
             variables["sort"] = TRANSACTION_SORT
         feed = cp.gql(GET_TRANSACTIONS, "TransactionsFeed", variables)["feed"]
-        page = [
-            strip_typename(e["node"])
-            for e in feed["edges"]
-            if e["node"].get("__typename") == "Transaction"
-        ]
+        page = [strip_typename(e["node"]) for e in feed["edges"] if e["node"].get("__typename") == "Transaction"]
 
         rows = [r for r in page if r["id"] not in known] if incremental else page
-        caught_up = incremental and len(rows) < len(
-            page
-        )  # saw an already-synced transaction
+        caught_up = incremental and len(rows) < len(page)  # saw an already-synced transaction
 
         if rows:
             stamp(rows, started_at)
@@ -627,8 +603,7 @@ ACCOUNT_COLS = [
 def dump_accounts(conn: sqlite3.Connection, out_dir: Path) -> int:
     select = ", ".join(f'"{c}"' for c in ACCOUNT_COLS)
     rows = conn.execute(
-        f"SELECT {select} FROM accounts "
-        "WHERE COALESCE(isUserClosed, 0) = 0 ORDER BY type, name"
+        f"SELECT {select} FROM accounts WHERE COALESCE(isUserClosed, 0) = 0 ORDER BY type, name"
     ).fetchall()
 
     with (out_dir / "accounts.csv").open("w", newline="") as f:
@@ -656,10 +631,7 @@ def dump_categories(conn: sqlite3.Connection, out_dir: Path) -> int:
     rows = conn.execute(
         "SELECT id, name, parent_id, isExcluded FROM categories ORDER BY parent_id IS NOT NULL, name"
     ).fetchall()
-    by_id = {
-        r[0]: {"id": r[0], "name": r[1], "parent_id": r[2], "isExcluded": r[3]}
-        for r in rows
-    }
+    by_id = {r[0]: {"id": r[0], "name": r[1], "parent_id": r[2], "isExcluded": r[3]} for r in rows}
     children: dict[str | None, list[dict]] = {}
     for c in by_id.values():
         children.setdefault(c["parent_id"], []).append(c)
@@ -672,9 +644,7 @@ def dump_categories(conn: sqlite3.Connection, out_dir: Path) -> int:
         for parent in children.get(None, []):
             w.writerow([parent["name"], "", parent["isExcluded"], parent["id"]])
             for child in children.get(parent["id"], []):
-                w.writerow(
-                    [child["name"], parent["name"], child["isExcluded"], child["id"]]
-                )
+                w.writerow([child["name"], parent["name"], child["isExcluded"], child["id"]])
 
     lines = ["# Categories", "", f"_{len(by_id)} categories._", ""]
     for parent in children.get(None, []):
@@ -712,12 +682,8 @@ def collect_stats(db: sqlite_utils.Database) -> dict:
             continue
         cols = set(t.columns_dict)
         tables[name] = {
-            "live": t.count_where("deleted_at is null")
-            if "deleted_at" in cols
-            else t.count,
-            "deleted": t.count_where("deleted_at is not null")
-            if "deleted_at" in cols
-            else 0,
+            "live": t.count_where("deleted_at is null") if "deleted_at" in cols else t.count,
+            "deleted": t.count_where("deleted_at is not null") if "deleted_at" in cols else 0,
             "dirty": t.count_where("dirty = 1") if "dirty" in cols else 0,
         }
         if "last_synced_at" in cols:
@@ -729,9 +695,7 @@ def collect_stats(db: sqlite_utils.Database) -> dict:
     if db["transactions"].exists():
         cols = set(db["transactions"].columns_dict)
         where = "where deleted_at is null" if "deleted_at" in cols else ""
-        order = "order by date desc" + (
-            ", createdAt desc" if "createdAt" in cols else ""
-        )
+        order = "order by date desc" + (", createdAt desc" if "createdAt" in cols else "")
         rows = list(db.query(f"select * from transactions {where} {order} limit 1"))
         if rows:
             r = rows[0]
@@ -831,12 +795,8 @@ def sync(
 def update(
     txn_id: str = typer.Argument(..., help="Transaction id to update."),
     name: str = typer.Option(None, "--name", help="New transaction name."),
-    category: str = typer.Option(
-        None, "--category", help="Category name, resolved against the local DB."
-    ),
-    description: str = typer.Option(
-        None, "--description", help="Note / description text."
-    ),
+    category: str = typer.Option(None, "--category", help="Category name, resolved against the local DB."),
+    description: str = typer.Option(None, "--description", help="Note / description text."),
     db: str = typer.Option("copilot.db", help="Path to the SQLite database."),
 ) -> None:
     """Update a transaction's name / category / description in Copilot."""
@@ -862,9 +822,7 @@ def update(
     except (ValueError, CategoryError) as e:
         typer.secho(str(e), fg="red", err=True)
         raise typer.Exit(1)
-    typer.echo(
-        f"updated {txn_id}: name={row.get('name')!r}, categoryId={row.get('categoryId')!r}"
-    )
+    typer.echo(f"updated {txn_id}: name={row.get('name')!r}, categoryId={row.get('categoryId')!r}")
 
 
 @app.command()
@@ -877,12 +835,8 @@ def export(
     out_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db)
     try:
-        typer.echo(
-            f"accounts:   {dump_accounts(conn, out_dir)} -> accounts.csv, accounts.md"
-        )
-        typer.echo(
-            f"categories: {dump_categories(conn, out_dir)} -> categories.csv, categories.md"
-        )
+        typer.echo(f"accounts:   {dump_accounts(conn, out_dir)} -> accounts.csv, accounts.md")
+        typer.echo(f"categories: {dump_categories(conn, out_dir)} -> categories.csv, categories.md")
     finally:
         conn.close()
 

@@ -54,9 +54,7 @@ def test_flatten_category_attaches_parent_id_and_drops_nested():
 
 
 def test_flatten_category_top_level_parent_id_is_none():
-    out = flatten_category(
-        {"id": "c1", "name": "Food", "__typename": "Category"}, parent_id=None
-    )
+    out = flatten_category({"id": "c1", "name": "Food", "__typename": "Category"}, parent_id=None)
     assert out["parent_id"] is None
 
 
@@ -175,9 +173,7 @@ def test_sweep_ignores_already_deleted_rows(db):
 
 def test_sweep_returns_zero_when_every_row_fresh(db):
     _seed(db, [{"id": "1"}, {"id": "2"}], at="2026-05-30T02:00:00Z")
-    n = sweep_deleted(
-        db, "accounts", "2026-05-30T02:00:00Z"
-    )  # same started_at as stamps
+    n = sweep_deleted(db, "accounts", "2026-05-30T02:00:00Z")  # same started_at as stamps
     assert n == 0
 
 
@@ -185,16 +181,12 @@ def test_sweep_returns_zero_when_every_row_fresh(db):
 
 
 def test_resolve_category_returns_id_for_unique_name(db):
-    _seed(
-        db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories"
-    )
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
     assert copilot.resolve_category(db, "Groceries") == "c1"
 
 
 def test_resolve_category_raises_on_missing_name(db):
-    _seed(
-        db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories"
-    )
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
     with pytest.raises(copilot.CategoryError) as exc:
         copilot.resolve_category(db, "Nonexistent")
     assert "Nonexistent" in str(exc.value)
@@ -297,9 +289,7 @@ def test_update_transaction_sends_ids_top_level_and_only_provided_fields_in_inpu
 
 
 def test_update_transaction_maps_category_name_to_id(db):
-    _seed(
-        db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories"
-    )
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
     _seed(
         db,
         [
@@ -314,9 +304,7 @@ def test_update_transaction_maps_category_name_to_id(db):
         table="transactions",
     )
     cp = MagicMock()
-    cp.gql.return_value = _edit_response(
-        {"id": "t1", "name": "old", "categoryId": "c1", "amount": 5}
-    )
+    cp.gql.return_value = _edit_response({"id": "t1", "name": "old", "categoryId": "c1", "amount": 5})
 
     copilot.update_transaction(db, cp, "t1", category="Groceries")
 
@@ -339,9 +327,7 @@ def test_update_transaction_maps_description_to_user_notes(db):
         table="transactions",
     )
     cp = MagicMock()
-    cp.gql.return_value = _edit_response(
-        {"id": "t1", "name": "old", "userNotes": "n", "amount": 5}
-    )
+    cp.gql.return_value = _edit_response({"id": "t1", "name": "old", "userNotes": "n", "amount": 5})
 
     copilot.update_transaction(db, cp, "t1", description="n")
 
@@ -349,9 +335,7 @@ def test_update_transaction_maps_description_to_user_notes(db):
 
 
 def test_update_transaction_patches_local_row_from_response(db):
-    _seed(
-        db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories"
-    )
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
     _seed(
         db,
         [
@@ -382,9 +366,7 @@ def test_update_transaction_patches_local_row_from_response(db):
         }
     )
 
-    row = copilot.update_transaction(
-        db, cp, "t1", name="New", category="Groceries", description="note"
-    )
+    row = copilot.update_transaction(db, cp, "t1", name="New", category="Groceries", description="note")
 
     # local row reflects the server response, not the values we sent
     assert row["name"] == "Server Name"
@@ -453,9 +435,7 @@ def test_sync_transactions_incremental_stops_at_known_transaction(db):
             ],
             has_next=True,
         ),
-        _feed(
-            [{"id": "t_older", "date": "2026-04-01"}], has_next=False
-        ),  # must NOT be fetched
+        _feed([{"id": "t_older", "date": "2026-04-01"}], has_next=False),  # must NOT be fetched
     ]
     total = copilot.sync_transactions(cp, db, "2026-05-30T00:00:00Z", incremental=True)
     assert total == 1  # only t_new is new
@@ -514,15 +494,11 @@ def test_collect_stats_latest_transaction(db):
     )
     s = copilot.collect_stats(db)
     assert s["latest_transaction"]["date"] == "2026-05-29"
-    assert s["latest_transaction"]["created_at"].startswith(
-        "20"
-    )  # rendered UTC timestamp
+    assert s["latest_transaction"]["created_at"].startswith("20")  # rendered UTC timestamp
 
 
 def test_collect_stats_latest_transaction_includes_name_category_description(db):
-    _seed(
-        db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories"
-    )
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
     _seed(
         db,
         [
@@ -550,9 +526,7 @@ def test_collect_stats_latest_transaction_includes_name_category_description(db)
 
 
 def test_collect_stats_latest_transaction_optional_fields_default_none(db):
-    _seed(
-        db, [{"id": "t1", "date": "2026-05-29", "name": "Solo"}], table="transactions"
-    )
+    _seed(db, [{"id": "t1", "date": "2026-05-29", "name": "Solo"}], table="transactions")
     lt = copilot.collect_stats(db)["latest_transaction"]
     assert lt["name"] == "Solo"
     assert lt["category"] is None  # no categoryId column / value
@@ -621,9 +595,7 @@ def test_cli_help_lists_all_subcommands():
 def test_stats_command_runs(tmp_path):
     dbpath = tmp_path / "c.db"
     sdb = sqlite_utils.Database(dbpath)
-    _seed(
-        sdb, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories"
-    )
+    _seed(sdb, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
     _seed(
         sdb,
         [
@@ -654,9 +626,7 @@ def test_stats_command_runs(tmp_path):
 
 def test_update_command_requires_a_field(tmp_path):
     # No --name/--category/--description must fail fast, before any network use.
-    result = runner.invoke(
-        copilot.app, ["update", "t1", "--db", str(tmp_path / "c.db")]
-    )
+    result = runner.invoke(copilot.app, ["update", "t1", "--db", str(tmp_path / "c.db")])
     assert result.exit_code != 0
     assert "at least one" in _output(result).lower()
 
