@@ -821,6 +821,77 @@ def _main(
     """Copilot Money CLI."""
 
 
+def _resolve_secrets() -> dict[str, str]:
+    """Populate the secret env vars (from .env, then the Keychain) and report
+    where each one was resolved from, following `_client`'s precedence: a real
+    environment variable wins over `.env`, which wins over the Keychain.
+
+    Returns a map of each secret env var to "environment variable", ".env file",
+    "Keychain", or "missing". Safe to call before `_client`, which re-runs the
+    same idempotent loaders.
+    """
+    in_env = {k: bool(os.environ.get(k)) for k in _SECRET_KEYS}
+    load_dotenv()
+    in_dotenv = {k: bool(os.environ.get(k)) for k in _SECRET_KEYS}
+    _load_secrets()
+    in_keychain = {k: bool(os.environ.get(k)) for k in _SECRET_KEYS}
+
+    sources: dict[str, str] = {}
+    for k in _SECRET_KEYS:
+        if in_env[k]:
+            sources[k] = "environment variable"
+        elif in_dotenv[k]:
+            sources[k] = ".env file"
+        elif in_keychain[k]:
+            sources[k] = "Keychain"
+        else:
+            sources[k] = "missing"
+    return sources
+
+
+def _format_secret_sources(sources: dict[str, str]) -> str:
+    """Render a one-line dim summary of where the credentials came from."""
+    found = {k: v for k, v in sources.items() if v != "missing"}
+    if not found:
+        return "[dim]No credentials found in the environment, .env, or Keychain.[/dim]"
+    distinct = set(found.values())
+    if len(found) == len(sources) and len(distinct) == 1:
+        return f"[dim]Credentials loaded from: {next(iter(distinct))}.[/dim]"
+    parts = ", ".join(f"{k} from {v}" for k, v in sources.items())
+    return f"[dim]Credentials: {parts}.[/dim]"
+
+
+@app.command()
+def check() -> None:
+    """Verify Copilot credentials and API access without syncing.
+
+    Mints a fresh ID token and runs a single accounts query \u2014 enough to prove
+    the stored credentials work end to end. Touches neither the database nor any
+    of your data. Exits non-zero on failure so it is usable in scripts.
+    """
+    console = Console()
+    sources = _resolve_secrets()
+    try:
+        with _client() as cp:
+            accounts = cp.gql(GET_ACCOUNTS, "Accounts")["accounts"]
+    except (RuntimeError, httpx.HTTPError) as e:
+        console.print(f"[red]\u2717 Copilot check failed.[/red] {e}")
+        console.print(_format_secret_sources(sources))
+        console.print(
+            "\nProvide working credentials and try again, by [bold]either[/bold]:\n"
+            "  \u2022 running the [cyan]copilot-auth[/cyan] Mac app to sign in and capture "
+            "them into the Keychain \u2014\n"
+            "    [blue]https://github.com/natikgadzhi/copilot-auth[/blue]\n"
+            "  \u2022 or grabbing them from a logged-in browser session and setting "
+            "[cyan]COPILOT_REFRESH_TOKEN[/cyan]\n"
+            "    and [cyan]FIREBASE_API_KEY[/cyan] in your environment / .env "
+            "(see the README)."
+        )
+        raise typer.Exit(1)
+    console.print(f"[green]\u2713 OK[/green] \u2014 credentials are valid; reached {len(accounts)} account(s).")
+    console.print(_format_secret_sources(sources))
+
+
 @app.command()
 def sync(
     db: str = typer.Option("copilot.db", help="Path to the SQLite database."),
