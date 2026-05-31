@@ -91,6 +91,16 @@ on upsert.
 only runs on a full sync — `--transactions-limit` skips it to avoid falsely
 marking the un-fetched tail as deleted.
 
+## Tests
+
+```sh
+uv run test_copilot.py
+```
+
+Covers CLI argument parsing and the DB helpers (idempotent upsert,
+`stamp`, `ensure_local_columns`, `sweep_deleted`). No network — the
+GraphQL client is not exercised.
+
 ## License
 
 [MIT](./LICENSE)
