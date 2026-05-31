@@ -8,6 +8,8 @@
 uv run test_copilot.py
 """
 
+import json
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,7 +18,9 @@ from typer.testing import CliRunner
 
 import copilot
 from copilot import (
+    KEYCHAIN_SERVICE,
     LOCAL_COLUMNS,
+    _load_secrets,
     ensure_local_columns,
     flatten_category,
     stamp,
@@ -629,6 +633,96 @@ def test_update_command_requires_a_field(tmp_path):
     result = runner.invoke(copilot.app, ["update", "t1", "--db", str(tmp_path / "c.db")])
     assert result.exit_code != 0
     assert "at least one" in _output(result).lower()
+
+
+# --- Keychain secret fallback -----------------------------------------------
+
+
+def _fake_security(stdout="", returncode=0):
+    """Build a stand-in for subprocess.run returning the given `security` output."""
+
+    def run(cmd, **kwargs):
+        assert cmd[:2] == ["security", "find-generic-password"]
+        assert KEYCHAIN_SERVICE in cmd
+        return MagicMock(stdout=stdout, returncode=returncode)
+
+    return run
+
+
+def _bundle(**values):
+    return json.dumps({"cookies": [], "values": values, "capturedAt": 0})
+
+
+def test_load_secrets_skips_keychain_when_env_already_set(monkeypatch):
+    monkeypatch.setenv("COPILOT_REFRESH_TOKEN", "env-rt")
+    monkeypatch.setenv("FIREBASE_API_KEY", "env-key")
+    called = False
+
+    def run(*args, **kwargs):
+        nonlocal called
+        called = True
+        return MagicMock(stdout="", returncode=0)
+
+    monkeypatch.setattr(copilot.subprocess, "run", run)
+    _load_secrets()
+    assert not called, "should not touch the Keychain when env vars are present"
+    assert os.environ["COPILOT_REFRESH_TOKEN"] == "env-rt"
+
+
+def test_load_secrets_populates_from_keychain_bundle(monkeypatch):
+    monkeypatch.delenv("COPILOT_REFRESH_TOKEN", raising=False)
+    monkeypatch.delenv("FIREBASE_API_KEY", raising=False)
+    monkeypatch.setattr(
+        copilot.subprocess,
+        "run",
+        _fake_security(stdout=_bundle(refreshToken="kc-rt", apiKey="kc-key")),
+    )
+    _load_secrets()
+    assert os.environ["COPILOT_REFRESH_TOKEN"] == "kc-rt"
+    assert os.environ["FIREBASE_API_KEY"] == "kc-key"
+
+
+def test_load_secrets_only_fills_the_missing_var(monkeypatch):
+    monkeypatch.setenv("COPILOT_REFRESH_TOKEN", "env-rt")
+    monkeypatch.delenv("FIREBASE_API_KEY", raising=False)
+    monkeypatch.setattr(
+        copilot.subprocess,
+        "run",
+        _fake_security(stdout=_bundle(refreshToken="kc-rt", apiKey="kc-key")),
+    )
+    _load_secrets()
+    assert os.environ["COPILOT_REFRESH_TOKEN"] == "env-rt"  # env wins
+    assert os.environ["FIREBASE_API_KEY"] == "kc-key"  # filled from Keychain
+
+
+def test_load_secrets_silent_when_item_missing(monkeypatch):
+    monkeypatch.delenv("COPILOT_REFRESH_TOKEN", raising=False)
+    monkeypatch.delenv("FIREBASE_API_KEY", raising=False)
+    # `security` exits non-zero when there's no matching item.
+    monkeypatch.setattr(copilot.subprocess, "run", _fake_security(stdout="", returncode=44))
+    _load_secrets()
+    assert "COPILOT_REFRESH_TOKEN" not in os.environ
+    assert "FIREBASE_API_KEY" not in os.environ
+
+
+def test_load_secrets_silent_on_malformed_json(monkeypatch):
+    monkeypatch.delenv("COPILOT_REFRESH_TOKEN", raising=False)
+    monkeypatch.delenv("FIREBASE_API_KEY", raising=False)
+    monkeypatch.setattr(copilot.subprocess, "run", _fake_security(stdout="not json"))
+    _load_secrets()
+    assert "COPILOT_REFRESH_TOKEN" not in os.environ
+
+
+def test_load_secrets_silent_when_security_missing(monkeypatch):
+    monkeypatch.delenv("COPILOT_REFRESH_TOKEN", raising=False)
+    monkeypatch.delenv("FIREBASE_API_KEY", raising=False)
+
+    def run(*args, **kwargs):
+        raise FileNotFoundError("security not found")
+
+    monkeypatch.setattr(copilot.subprocess, "run", run)
+    _load_secrets()  # must not raise
+    assert "COPILOT_REFRESH_TOKEN" not in os.environ
 
 
 if __name__ == "__main__":

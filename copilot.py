@@ -11,12 +11,16 @@ export annotation-friendly summaries.
     uv run copilot.py export [--db PATH] [--out DIR]
     uv run copilot.py --version
 
-Required env (in .env or the environment):
+Required secrets:
   FIREBASE_API_KEY        public web API key (?key=AIza…) from any *.googleapis.com request
   COPILOT_REFRESH_TOKEN   from IndexedDB firebaseLocalStorageDb -> stsTokenManager.refreshToken
 
-A fresh 1h ID token is minted at startup; no manual re-paste needed unless
-the refresh token itself gets revoked.
+Provide them via the environment / .env, or let the companion `copilot-auth` Mac
+app capture them into the Keychain (service io.respawn.copilot) — `_load_secrets`
+reads that as a fallback when the env vars are unset. Env / .env always win.
+
+A fresh 1h ID token is minted at startup; no manual re-auth needed unless the
+refresh token itself gets revoked.
 """
 
 import csv
@@ -24,6 +28,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,6 +55,11 @@ LOCAL_COLUMNS: dict[str, type] = {
 
 API_URL = "https://app.copilot.money/api/graphql"
 TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
+
+# Keychain item the companion `copilot-auth` Mac app writes (a webauth
+# SecretBundle). Read as a fallback when the env / .env don't already carry the
+# secrets — see `_load_secrets`.
+KEYCHAIN_SERVICE = "io.respawn.copilot"
 
 
 def mint_id_token(refresh_token: str, api_key: str) -> str:
@@ -727,8 +737,51 @@ app = typer.Typer(
 )
 
 
+# Maps the env vars this CLI reads to their key in the Keychain bundle's `values`.
+_SECRET_KEYS = {"COPILOT_REFRESH_TOKEN": "refreshToken", "FIREBASE_API_KEY": "apiKey"}
+
+
+def _load_secrets() -> None:
+    """Fill any missing secret env vars from the Keychain item written by the
+    companion `copilot-auth` Mac app.
+
+    Environment and `.env` always win: we only shell out to `security` for vars
+    that are still unset, so CI and the manual-paste path are unaffected. Every
+    failure mode (no `security`, no item, malformed JSON) degrades silently to
+    "leave it unset" — `_client` then raises the same clear error as before.
+    """
+    missing = {env: key for env, key in _SECRET_KEYS.items() if not os.environ.get(env)}
+    if not missing:
+        return
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode != 0 or not result.stdout.strip():
+        return
+    try:
+        values = json.loads(result.stdout).get("values", {})
+    except json.JSONDecodeError:
+        return
+    for env, key in missing.items():
+        if value := values.get(key):
+            os.environ[env] = value
+
+
 def _client() -> Copilot:
-    return Copilot(os.environ["COPILOT_REFRESH_TOKEN"], os.environ["FIREBASE_API_KEY"])
+    _load_secrets()
+    try:
+        return Copilot(os.environ["COPILOT_REFRESH_TOKEN"], os.environ["FIREBASE_API_KEY"])
+    except KeyError as missing:
+        raise RuntimeError(
+            f"Missing {missing.args[0]}. Set it in the environment or .env, or run the "
+            "copilot-auth Mac app to capture a Copilot session into the Keychain."
+        ) from missing
 
 
 def _version_callback(value: bool) -> None:

@@ -20,17 +20,25 @@ to manage) with these subcommands:
 ## Setup
 
 1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
-2. Create a `.env` file with two values pulled from a logged-in browser session
-   on `app.copilot.money`:
+2. Provide two secrets — the Firebase `FIREBASE_API_KEY` and
+   `COPILOT_REFRESH_TOKEN` — by **either** of:
 
-   ```env
-   FIREBASE_API_KEY=AIza...          # from any *.googleapis.com request (?key=)
-   COPILOT_REFRESH_TOKEN=...         # IndexedDB > firebaseLocalStorageDb >
-                                     # stsTokenManager.refreshToken
-   ```
+   - **The `copilot-auth` Mac app (recommended).** Sign in to Copilot in a real
+     web view and it captures both secrets into the macOS Keychain. `copilot.py`
+     reads them automatically (via `security`) when they aren't already in the
+     environment. See [copilot-auth](https://github.com/natikgadzhi/copilot-auth).
+   - **A `.env` file**, with values pulled from a logged-in browser session on
+     `app.copilot.money`:
 
-   The script mints a fresh 1-hour ID token at startup using the refresh token,
-   so you only need to re-paste these if the refresh token itself is revoked.
+     ```env
+     FIREBASE_API_KEY=AIza...          # from any *.googleapis.com request (?key=)
+     COPILOT_REFRESH_TOKEN=...         # IndexedDB > firebaseLocalStorageDb >
+                                       # stsTokenManager.refreshToken
+     ```
+
+   Environment / `.env` always take precedence over the Keychain. The script
+   mints a fresh 1-hour ID token at startup using the refresh token, so you only
+   re-authenticate if the refresh token itself is revoked.
 
 ## Usage
 
