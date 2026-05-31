@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-05-30
 
 ### Added
 - `stats` command — `rich` tables showing per-table live / soft-deleted / dirty
