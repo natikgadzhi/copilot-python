@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import string
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -741,6 +742,26 @@ app = typer.Typer(
 _SECRET_KEYS = {"COPILOT_REFRESH_TOKEN": "refreshToken", "FIREBASE_API_KEY": "apiKey"}
 
 
+def _parse_keychain_bundle(raw: str) -> dict:
+    """Parse the SecretBundle JSON that `security -w` prints for our item.
+
+    `security -w` emits the data as a **hex string** when it contains control
+    bytes — which a pretty-printed bundle does (newlines). So if the output is
+    all hex, decode it back to text before parsing. Returns {} on any problem.
+    """
+    raw = raw.strip()
+    if raw and len(raw) % 2 == 0 and all(c in string.hexdigits for c in raw):
+        try:
+            raw = bytes.fromhex(raw).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _load_secrets() -> None:
     """Fill any missing secret env vars from the Keychain item written by the
     companion `copilot-auth` Mac app.
@@ -764,10 +785,7 @@ def _load_secrets() -> None:
         return
     if result.returncode != 0 or not result.stdout.strip():
         return
-    try:
-        values = json.loads(result.stdout).get("values", {})
-    except json.JSONDecodeError:
-        return
+    values = _parse_keychain_bundle(result.stdout).get("values", {})
     for env, key in missing.items():
         if value := values.get(key):
             os.environ[env] = value

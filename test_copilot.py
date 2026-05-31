@@ -21,6 +21,7 @@ from copilot import (
     KEYCHAIN_SERVICE,
     LOCAL_COLUMNS,
     _load_secrets,
+    _parse_keychain_bundle,
     ensure_local_columns,
     flatten_category,
     stamp,
@@ -711,6 +712,34 @@ def test_load_secrets_silent_on_malformed_json(monkeypatch):
     monkeypatch.setattr(copilot.subprocess, "run", _fake_security(stdout="not json"))
     _load_secrets()
     assert "COPILOT_REFRESH_TOKEN" not in os.environ
+
+
+def test_parse_keychain_bundle_plain_json():
+    parsed = _parse_keychain_bundle('{"values": {"refreshToken": "rt", "apiKey": "AIza"}}')
+    assert parsed["values"]["refreshToken"] == "rt"
+
+
+def test_parse_keychain_bundle_hex_encoded():
+    # `security -w` hex-encodes data with control bytes (a pretty-printed bundle).
+    bundle = '{\n  "values" : {\n    "apiKey" : "AIza",\n    "refreshToken" : "rt"\n  }\n}'
+    hex_blob = bundle.encode("utf-8").hex()
+    parsed = _parse_keychain_bundle(hex_blob)
+    assert parsed["values"]["apiKey"] == "AIza"
+
+
+def test_parse_keychain_bundle_garbage_returns_empty():
+    assert _parse_keychain_bundle("not json at all") == {}
+    assert _parse_keychain_bundle("") == {}
+
+
+def test_load_secrets_decodes_hex_keychain_output(monkeypatch):
+    monkeypatch.delenv("COPILOT_REFRESH_TOKEN", raising=False)
+    monkeypatch.delenv("FIREBASE_API_KEY", raising=False)
+    hex_blob = _bundle(refreshToken="kc-rt", apiKey="kc-key").encode("utf-8").hex()
+    monkeypatch.setattr(copilot.subprocess, "run", _fake_security(stdout=hex_blob))
+    _load_secrets()
+    assert os.environ["COPILOT_REFRESH_TOKEN"] == "kc-rt"
+    assert os.environ["FIREBASE_API_KEY"] == "kc-key"
 
 
 def test_load_secrets_silent_when_security_missing(monkeypatch):
