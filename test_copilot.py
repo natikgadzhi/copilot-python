@@ -1,24 +1,23 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pytest", "httpx", "sqlite-utils", "python-dotenv"]
+# dependencies = ["pytest", "httpx", "sqlite-utils", "python-dotenv", "typer"]
 # ///
 """Unit tests for copilot.py — CLI parsing and DB helpers, no network.
 
     uv run test_copilot.py
 """
-import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import pytest
 import sqlite_utils
+from typer.testing import CliRunner
 
 import copilot
 from copilot import (
     LOCAL_COLUMNS,
     ensure_local_columns,
     flatten_category,
-    parse_args,
     stamp,
     strip_typename,
     sweep_deleted,
@@ -159,32 +158,172 @@ def test_sweep_returns_zero_when_every_row_fresh(db):
     assert n == 0
 
 
-# --- CLI --------------------------------------------------------------------
+# --- resolve_category -------------------------------------------------------
 
-def _parse(args):
-    with patch.object(sys, "argv", ["copilot.py", *args]):
-        return parse_args()
-
-
-def test_cli_defaults():
-    args = _parse([])
-    assert args.db == "copilot.db"
-    assert args.transactions_limit is None
+def test_resolve_category_returns_id_for_unique_name(db):
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
+    assert copilot.resolve_category(db, "Groceries") == "c1"
 
 
-def test_cli_db_flag():
-    assert _parse(["--db", "foo.db"]).db == "foo.db"
+def test_resolve_category_raises_on_missing_name(db):
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
+    with pytest.raises(copilot.CategoryError) as exc:
+        copilot.resolve_category(db, "Nonexistent")
+    assert "Nonexistent" in str(exc.value)
 
 
-def test_cli_transactions_limit_flag():
-    assert _parse(["--transactions-limit", "500"]).transactions_limit == 500
+def test_resolve_category_raises_and_lists_candidates_when_ambiguous(db):
+    _seed(db, [
+        {"id": "c1", "name": "Coffee", "parent_id": "food"},
+        {"id": "c2", "name": "Coffee", "parent_id": "fun"},
+    ], table="categories")
+    with pytest.raises(copilot.CategoryError) as exc:
+        copilot.resolve_category(db, "Coffee")
+    msg = str(exc.value)
+    assert "c1" in msg and "c2" in msg  # both candidate ids surfaced for disambiguation
 
 
-def test_cli_version_prints_version_and_exits(capsys):
-    with pytest.raises(SystemExit) as exc:
-        _parse(["--version"])
-    assert exc.value.code == 0
-    assert copilot.__version__ in capsys.readouterr().out
+def test_resolve_category_ignores_soft_deleted(db):
+    _seed(db, [{"id": "c1", "name": "Old", "parent_id": None}], table="categories")
+    db["categories"].update("c1", {"deleted_at": "2026-05-30T00:00:00Z"})
+    with pytest.raises(copilot.CategoryError):
+        copilot.resolve_category(db, "Old")
+
+
+# --- update_transaction -----------------------------------------------------
+
+def test_update_transaction_requires_at_least_one_field(db):
+    _seed(db, [{"id": "t1", "name": "old"}], table="transactions")
+    cp = MagicMock()
+    with pytest.raises(ValueError):
+        copilot.update_transaction(db, cp, "t1")
+    cp.gql.assert_not_called()
+
+
+def test_update_transaction_fails_for_unknown_id(db):
+    _seed(db, [{"id": "t1", "name": "old"}], table="transactions")
+    cp = MagicMock()
+    with pytest.raises(ValueError) as exc:
+        copilot.update_transaction(db, cp, "nope", name="x")
+    assert "nope" in str(exc.value)
+    cp.gql.assert_not_called()
+
+
+def test_update_transaction_fails_for_soft_deleted(db):
+    _seed(db, [{"id": "t1", "name": "old"}], table="transactions")
+    db["transactions"].update("t1", {"deleted_at": "2026-05-30T00:00:00Z"})
+    cp = MagicMock()
+    with pytest.raises(ValueError):
+        copilot.update_transaction(db, cp, "t1", name="x")
+    cp.gql.assert_not_called()
+
+
+def test_update_transaction_resolves_category_before_calling_api(db):
+    _seed(db, [{"id": "t1", "name": "old"}], table="transactions")
+    cp = MagicMock()
+    with pytest.raises(copilot.CategoryError):
+        copilot.update_transaction(db, cp, "t1", category="Ghost")
+    cp.gql.assert_not_called()
+
+
+def _edit_response(txn: dict) -> dict:
+    """Shape of the real editTransaction mutation response."""
+    return {"editTransaction": {"transaction": {**txn, "__typename": "Transaction"}, "__typename": "EditTransactionPayload"}}
+
+
+def test_update_transaction_sends_ids_top_level_and_only_provided_fields_in_input(db):
+    _seed(db, [{"id": "t1", "name": "old", "accountId": "acc1", "itemId": "item1", "amount": 5}], table="transactions")
+    cp = MagicMock()
+    cp.gql.return_value = _edit_response({"id": "t1", "name": "New", "amount": 5})
+
+    copilot.update_transaction(db, cp, "t1", name="New")
+
+    variables = cp.gql.call_args.args[2]  # gql(query, op, variables)
+    # itemId/accountId/id are top-level (pulled from the local row); input holds only edits
+    assert variables["id"] == "t1"
+    assert variables["accountId"] == "acc1"
+    assert variables["itemId"] == "item1"
+    assert variables["input"] == {"name": "New"}  # no categoryId / userNotes keys
+
+
+def test_update_transaction_maps_category_name_to_id(db):
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
+    _seed(db, [{"id": "t1", "name": "old", "accountId": "acc1", "itemId": "item1", "amount": 5}], table="transactions")
+    cp = MagicMock()
+    cp.gql.return_value = _edit_response({"id": "t1", "name": "old", "categoryId": "c1", "amount": 5})
+
+    copilot.update_transaction(db, cp, "t1", category="Groceries")
+
+    variables = cp.gql.call_args.args[2]
+    assert variables["input"]["categoryId"] == "c1"
+
+
+def test_update_transaction_maps_description_to_user_notes(db):
+    _seed(db, [{"id": "t1", "name": "old", "accountId": "acc1", "itemId": "item1", "amount": 5}], table="transactions")
+    cp = MagicMock()
+    cp.gql.return_value = _edit_response({"id": "t1", "name": "old", "userNotes": "n", "amount": 5})
+
+    copilot.update_transaction(db, cp, "t1", description="n")
+
+    assert cp.gql.call_args.args[2]["input"] == {"userNotes": "n"}
+
+
+def test_update_transaction_patches_local_row_from_response(db):
+    _seed(db, [{"id": "c1", "name": "Groceries", "parent_id": None}], table="categories")
+    _seed(db, [{"id": "t1", "name": "old", "categoryId": "x", "userNotes": None,
+                "accountId": "acc1", "itemId": "item1", "amount": 5}], table="transactions")
+
+    # server echoes back normalized values that differ from what we sent
+    cp = MagicMock()
+    cp.gql.return_value = _edit_response({"id": "t1", "name": "Server Name", "categoryId": "c1",
+                                          "userNotes": "from server", "accountId": "acc1",
+                                          "itemId": "item1", "amount": 5})
+
+    row = copilot.update_transaction(db, cp, "t1", name="New", category="Groceries", description="note")
+
+    # local row reflects the server response, not the values we sent
+    assert row["name"] == "Server Name"
+    assert row["categoryId"] == "c1"
+    assert row["userNotes"] == "from server"
+    assert "__typename" not in row
+    assert len(row["remote_hash"]) == 32
+    assert row["last_synced_at"] is not None
+
+
+# --- CLI (Typer) ------------------------------------------------------------
+
+runner = CliRunner()
+
+
+def _output(result) -> str:
+    """All captured text, whether or not stderr was separately captured."""
+    out = result.stdout or ""
+    try:
+        out += result.stderr or ""
+    except (ValueError, AttributeError):
+        pass  # stderr mixed into stdout on this Click version
+    return out
+
+
+def test_cli_version_prints_version_and_exits():
+    result = runner.invoke(copilot.app, ["--version"])
+    assert result.exit_code == 0
+    assert copilot.__version__ in _output(result)
+
+
+def test_cli_help_lists_all_subcommands():
+    result = runner.invoke(copilot.app, ["--help"])
+    assert result.exit_code == 0
+    out = _output(result)
+    for cmd in ("sync", "update", "export"):
+        assert cmd in out
+
+
+def test_update_command_requires_a_field(tmp_path):
+    # No --name/--category/--description must fail fast, before any network use.
+    result = runner.invoke(copilot.app, ["update", "t1", "--db", str(tmp_path / "c.db")])
+    assert result.exit_code != 0
+    assert "at least one" in _output(result).lower()
 
 
 if __name__ == "__main__":

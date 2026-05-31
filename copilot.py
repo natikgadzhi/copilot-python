@@ -1,11 +1,14 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["httpx", "sqlite-utils", "python-dotenv"]
+# dependencies = ["httpx", "sqlite-utils", "python-dotenv", "typer"]
 # ///
-"""Export Copilot Money data to a SQLite database.
+"""Copilot Money CLI: sync data into SQLite, write transaction edits back, and
+export annotation-friendly summaries.
 
-    uv run copilot.py [--db PATH] [--transactions-limit N]
+    uv run copilot.py sync [--db PATH] [--transactions-limit N]
+    uv run copilot.py update TXN_ID [--name ...] [--category ...] [--description ...]
+    uv run copilot.py export [--db PATH] [--out DIR]
     uv run copilot.py --version
 
 Required env (in .env or the environment):
@@ -15,17 +18,20 @@ Required env (in .env or the environment):
 A fresh 1h ID token is minted at startup; no manual re-paste needed unless
 the refresh token itself gets revoked.
 """
-import argparse
+import csv
 import hashlib
 import json
 import os
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import sqlite_utils
+import typer
 from dotenv import load_dotenv
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Columns owned by this tool, never overwritten by remote upserts. local_notes
 # and local_updated_at are hand-edited; the rest are bookkeeping for sync.
@@ -125,6 +131,24 @@ def sweep_deleted(db: sqlite_utils.Database, table: str, started_at: str) -> int
             [started_at, started_at],
         )
     return cur.rowcount
+
+
+class CategoryError(Exception):
+    """Raised when a --category name can't be resolved to exactly one live category."""
+
+
+def resolve_category(db: sqlite_utils.Database, name: str) -> str:
+    """Resolve a category name to its id via the local categories table.
+
+    Raises CategoryError if no live category matches, or if the name is
+    ambiguous (listing the candidate ids so the caller can disambiguate)."""
+    matches = list(db["categories"].rows_where("name = ? AND deleted_at IS NULL", [name]))
+    if not matches:
+        raise CategoryError(f"No category named {name!r}. Run `sync` first or check the spelling.")
+    if len(matches) > 1:
+        candidates = ", ".join(f"{m['id']} (parent={m['parent_id']})" for m in matches)
+        raise CategoryError(f"Category name {name!r} is ambiguous; matches: {candidates}.")
+    return matches[0]["id"]
 
 
 GET_ACCOUNTS = """
@@ -359,6 +383,130 @@ fragment TransactionFields on Transaction {
 """
 
 
+# Editable-field names inside EditTransactionInput. `userNotes` and `categoryId`
+# are confirmed by live edits; `name` is inferred (matches the Transaction field
+# and input type) — re-capture a name edit if a live call ever rejects it.
+DESCRIPTION_FIELD = "userNotes"
+
+# Captured verbatim from app.copilot.money. itemId/accountId/id are top-level
+# args; only the edited fields go in `input`. The response returns the full
+# Transaction so the local row can be patched from it.
+EDIT_TRANSACTION = """
+mutation EditTransaction($itemId: ID!, $accountId: ID!, $id: ID!, $input: EditTransactionInput) {
+  editTransaction(itemId: $itemId, accountId: $accountId, id: $id, input: $input) {
+    transaction {
+      ...TransactionFields
+      __typename
+    }
+    __typename
+  }
+}
+
+fragment TagFields on Tag {
+  colorName
+  name
+  id
+  __typename
+}
+
+fragment GoalFields on Goal {
+  name
+  icon {
+    ... on EmojiUnicode {
+      unicode
+      __typename
+    }
+    ... on Genmoji {
+      id
+      src
+      __typename
+    }
+    __typename
+  }
+  id
+  __typename
+}
+
+fragment TransactionFields on Transaction {
+  suggestedCategoryIds
+  hasSplitError
+  recurringId
+  categoryId
+  isReviewed
+  accountId
+  createdAt
+  isPending
+  tipAmount
+  userNotes
+  parentId
+  itemId
+  amount
+  date
+  name
+  type
+  id
+  tags {
+    ...TagFields
+    __typename
+  }
+  goal {
+    ...GoalFields
+    __typename
+  }
+  __typename
+}
+"""
+EDIT_TRANSACTION_OP = "EditTransaction"
+EDIT_TRANSACTION_FIELD = "editTransaction"
+
+
+def update_transaction(
+    db: sqlite_utils.Database,
+    cp: Copilot,
+    txn_id: str,
+    *,
+    name: str | None = None,
+    category: str | None = None,
+    description: str | None = None,
+) -> dict:
+    """Update a transaction's name / category / note in Copilot, then patch the
+    local row from the server's response. Returns the patched local row.
+
+    Only the provided fields are sent (partial update). Raises ValueError when
+    no field is given or the transaction isn't present locally, and
+    CategoryError when ``category`` can't be resolved to a single category."""
+    if name is None and category is None and description is None:
+        raise ValueError("Nothing to update: pass at least one of name / category / description.")
+
+    if not db["transactions"].exists():
+        raise ValueError("No transactions table in the DB — run `sync` first.")
+    try:
+        existing = db["transactions"].get(txn_id)
+    except sqlite_utils.db.NotFoundError:
+        raise ValueError(f"No transaction with id {txn_id!r} in the local DB — run `sync` first or check the id.")
+    if existing.get("deleted_at") is not None:
+        raise ValueError(f"Transaction {txn_id!r} is soft-deleted locally; refusing to update.")
+
+    fields: dict = {}
+    if name is not None:
+        fields["name"] = name
+    if category is not None:
+        fields["categoryId"] = resolve_category(db, category)
+    if description is not None:
+        fields[DESCRIPTION_FIELD] = description
+
+    data = cp.gql(EDIT_TRANSACTION, EDIT_TRANSACTION_OP, {
+        "itemId": existing.get("itemId"),
+        "accountId": existing.get("accountId"),
+        "id": txn_id,
+        "input": fields,
+    })
+    updated = strip_typename(data[EDIT_TRANSACTION_FIELD]["transaction"])
+    stamp([updated], datetime.now(timezone.utc).isoformat())
+    db["transactions"].upsert(updated, pk="id", alter=True)
+    return db["transactions"].get(txn_id)
+
+
 def sync_accounts(cp: Copilot, db: sqlite_utils.Database, started_at: str) -> int:
     rows = [strip_typename(a) for a in cp.gql(GET_ACCOUNTS, "Accounts")["accounts"]]
     stamp(rows, started_at)
@@ -399,42 +547,169 @@ def sync_transactions(cp: Copilot, db: sqlite_utils.Database, started_at: str, l
         after = feed["pageInfo"]["endCursor"]
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        prog="copilot",
-        description="Sync Copilot Money data into a local SQLite database.",
-    )
-    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("--db", default="copilot.db", help="path to the SQLite database (default: copilot.db)")
-    p.add_argument(
-        "--transactions-limit",
-        type=int,
-        default=None,
-        metavar="N",
-        help="stop after syncing at least N transactions (default: full sync)",
-    )
-    return p.parse_args()
+# --- export (CSV / Markdown summaries) --------------------------------------
+
+ACCOUNT_COLS = ["name", "type", "subType", "mask", "balance", "limit", "institutionId", "isManual", "id"]
 
 
-def main() -> None:
-    args = parse_args()
+def dump_accounts(conn: sqlite3.Connection, out_dir: Path) -> int:
+    select = ", ".join(f'"{c}"' for c in ACCOUNT_COLS)
+    rows = conn.execute(
+        f'SELECT {select} FROM accounts '
+        'WHERE COALESCE(isUserClosed, 0) = 0 ORDER BY type, name'
+    ).fetchall()
+
+    with (out_dir / "accounts.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(ACCOUNT_COLS)
+        w.writerows(rows)
+
+    lines = ["# Open Accounts", "", f"_{len(rows)} accounts._", ""]
+    current_type = None
+    for r in rows:
+        d = dict(zip(ACCOUNT_COLS, r))
+        if d["type"] != current_type:
+            current_type = d["type"]
+            lines += ["", f"## {current_type}", ""]
+        mask = f" ····{d['mask']}" if d["mask"] else ""
+        balance = f"{d['balance']:,.2f}" if d["balance"] is not None else "—"
+        sub = f" _{d['subType']}_" if d["subType"] else ""
+        lines.append(f"- **{d['name']}**{mask} —{sub} balance: `{balance}`")
+        lines.append(f"  - notes: ")
+    (out_dir / "accounts.md").write_text("\n".join(lines) + "\n")
+    return len(rows)
+
+
+def dump_categories(conn: sqlite3.Connection, out_dir: Path) -> int:
+    rows = conn.execute(
+        "SELECT id, name, parent_id, isExcluded FROM categories ORDER BY parent_id IS NOT NULL, name"
+    ).fetchall()
+    by_id = {r[0]: {"id": r[0], "name": r[1], "parent_id": r[2], "isExcluded": r[3]} for r in rows}
+    children: dict[str | None, list[dict]] = {}
+    for c in by_id.values():
+        children.setdefault(c["parent_id"], []).append(c)
+    for kids in children.values():
+        kids.sort(key=lambda c: c["name"].lower())
+
+    with (out_dir / "categories.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["name", "parent_name", "isExcluded", "id"])
+        for parent in children.get(None, []):
+            w.writerow([parent["name"], "", parent["isExcluded"], parent["id"]])
+            for child in children.get(parent["id"], []):
+                w.writerow([child["name"], parent["name"], child["isExcluded"], child["id"]])
+
+    lines = ["# Categories", "", f"_{len(by_id)} categories._", ""]
+    for parent in children.get(None, []):
+        excl = " _(excluded)_" if parent["isExcluded"] else ""
+        lines.append(f"- **{parent['name']}**{excl}")
+        lines.append(f"  - notes: ")
+        for child in children.get(parent["id"], []):
+            excl = " _(excluded)_" if child["isExcluded"] else ""
+            lines.append(f"  - {child['name']}{excl}")
+            lines.append(f"    - notes: ")
+    (out_dir / "categories.md").write_text("\n".join(lines) + "\n")
+    return len(by_id)
+
+
+# --- CLI (Typer) ------------------------------------------------------------
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Sync Copilot Money data into SQLite, write edits back, and export summaries.",
+)
+
+
+def _client() -> Copilot:
+    return Copilot(os.environ["COPILOT_REFRESH_TOKEN"], os.environ["FIREBASE_API_KEY"])
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"copilot {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False, "--version", callback=_version_callback, is_eager=True, help="Show version and exit."
+    ),
+) -> None:
+    """Copilot Money CLI."""
+
+
+@app.command()
+def sync(
+    db: str = typer.Option("copilot.db", help="Path to the SQLite database."),
+    transactions_limit: int = typer.Option(
+        None, "--transactions-limit", metavar="N",
+        help="Stop after syncing at least N transactions (default: full sync).",
+    ),
+) -> None:
+    """Sync accounts, categories, and the transactions feed into SQLite."""
     load_dotenv()
-    db = sqlite_utils.Database(args.db)
+    database = sqlite_utils.Database(db)
     started_at = datetime.now(timezone.utc).isoformat()
-    with Copilot(os.environ["COPILOT_REFRESH_TOKEN"], os.environ["FIREBASE_API_KEY"]) as cp:
-        print(f"accounts:     {sync_accounts(cp, db, started_at)}")
-        print(f"categories:   {sync_categories(cp, db, started_at)}")
-        print(f"transactions: {sync_transactions(cp, db, started_at, limit=args.transactions_limit)}")
+    with _client() as cp:
+        print(f"accounts:     {sync_accounts(cp, database, started_at)}")
+        print(f"categories:   {sync_categories(cp, database, started_at)}")
+        print(f"transactions: {sync_transactions(cp, database, started_at, limit=transactions_limit)}")
     # Soft-delete rows the remote no longer returns. Transactions are skipped
     # when --transactions-limit caps the sync — partial pulls would falsely
     # flag the un-fetched tail as deleted.
-    print(f"soft-deleted: accounts={sweep_deleted(db, 'accounts', started_at)}, "
-          f"categories={sweep_deleted(db, 'categories', started_at)}", end="")
-    if args.transactions_limit is None:
-        print(f", transactions={sweep_deleted(db, 'transactions', started_at)}")
+    print(f"soft-deleted: accounts={sweep_deleted(database, 'accounts', started_at)}, "
+          f"categories={sweep_deleted(database, 'categories', started_at)}", end="")
+    if transactions_limit is None:
+        print(f", transactions={sweep_deleted(database, 'transactions', started_at)}")
     else:
         print(" (transactions sweep skipped — partial sync)")
 
 
+@app.command()
+def update(
+    txn_id: str = typer.Argument(..., help="Transaction id to update."),
+    name: str = typer.Option(None, "--name", help="New transaction name."),
+    category: str = typer.Option(None, "--category", help="Category name, resolved against the local DB."),
+    description: str = typer.Option(None, "--description", help="Note / description text."),
+    db: str = typer.Option("copilot.db", help="Path to the SQLite database."),
+) -> None:
+    """Update a transaction's name / category / description in Copilot."""
+    if name is None and category is None and description is None:
+        typer.secho(
+            "Nothing to update: pass at least one of --name / --category / --description.",
+            fg="red", err=True,
+        )
+        raise typer.Exit(1)
+    load_dotenv()
+    database = sqlite_utils.Database(db)
+    try:
+        with _client() as cp:
+            row = update_transaction(
+                database, cp, txn_id, name=name, category=category, description=description
+            )
+    except (ValueError, CategoryError) as e:
+        typer.secho(str(e), fg="red", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"updated {txn_id}: name={row.get('name')!r}, categoryId={row.get('categoryId')!r}")
+
+
+@app.command()
+def export(
+    db: str = typer.Option("copilot.db", help="Path to the SQLite database."),
+    out: str = typer.Option(".", help="Output directory for the CSV/Markdown files."),
+) -> None:
+    """Write accounts.{csv,md} and categories.{csv,md} from the SQLite DB."""
+    out_dir = Path(out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    try:
+        typer.echo(f"accounts:   {dump_accounts(conn, out_dir)} -> accounts.csv, accounts.md")
+        typer.echo(f"categories: {dump_categories(conn, out_dir)} -> categories.csv, categories.md")
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
-    main()
+    app()
