@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Lint (ruff)
+        run: uvx ruff@0.15.15 check copilot.py test_copilot.py
+
+      - name: Format check (ruff)
+        run: uvx ruff@0.15.15 format --check copilot.py test_copilot.py
+
+      - name: Unit tests
+        run: uv run test_copilot.py -q
