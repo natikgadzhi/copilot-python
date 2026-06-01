@@ -17,9 +17,28 @@ to manage) with these subcommands:
 | `export` | Read the SQLite DB and emit `accounts.{csv,md}` + `categories.{csv,md}`.  |
 | `stats`  | Print row counts, the latest transaction, and the last sync time.        |
 
+## Install
+
+Install with Homebrew — this pulls in `uv` and puts a `copilot-cli` command on
+your PATH, so you never have to type `uv run copilot.py` again:
+
+```sh
+brew install natikgadzhi/taps/copilot-cli
+copilot-cli --version
+```
+
+`copilot-cli` is a thin wrapper around the same `copilot.py` uv script (deps are
+still resolved and cached by uv on first run), so it's a drop-in replacement for
+`uv run copilot.py` everywhere below: `copilot-cli sync`, `copilot-cli stats`,
+and so on.
+
+Prefer to run from a clone? Install [uv](https://docs.astral.sh/uv/getting-started/installation/)
+and use `uv run copilot.py …` directly — no install step needed.
+
 ## Setup
 
-1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (or
+   `brew install natikgadzhi/taps/copilot-cli`, which bundles it).
 2. Provide two secrets — the Firebase `FIREBASE_API_KEY` and
    `COPILOT_REFRESH_TOKEN` — by **either** of:
 
