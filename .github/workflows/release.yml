@@ -24,7 +24,7 @@ jobs:
     name: Publish asset and update the tap
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve version
         id: version
@@ -56,7 +56,7 @@ jobs:
           echo "copilot.py  sha256=${sha}"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           files: copilot.py
@@ -71,7 +71,7 @@ jobs:
             **copilot.py sha256:** `${{ steps.checksum.outputs.sha256 }}`
 
       - name: Check out the Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: natikgadzhi/homebrew-taps
           token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
