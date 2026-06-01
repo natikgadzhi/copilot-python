@@ -1,0 +1,131 @@
+name: Release
+
+# Tag-triggered release for the copilot.py uv script. Publishes copilot.py as a
+# release asset (verbatim — its sha256 is just the file's hash) and regenerates
+# the Homebrew formula in natikgadzhi/homebrew-taps so `brew upgrade` picks it up.
+#
+# Why workflow_dispatch in addition to `on: push tags`: a tag pushed with the
+# default GITHUB_TOKEN does NOT start other workflows, so tag.yml dispatches this
+# explicitly on the new tag ref (same pattern as the copilot-auth repo).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.4.0)"
+        required: true
+
+permissions:
+  contents: write # create the Release + upload assets
+
+jobs:
+  release:
+    name: Publish asset and update the tap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="${ref#refs/tags/}"
+          version="${tag#v}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not parse a semver from tag '${tag}'." >&2
+            exit 1
+          fi
+          # The asset is copilot.py verbatim, so __version__ must match the tag —
+          # otherwise the published file would disagree with the release version.
+          script_version="$(grep -E '^__version__ = ' copilot.py | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [[ "${script_version}" != "${version}" ]]; then
+            echo "__version__ (${script_version}) does not match tag (${version})." >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute SHA-256
+        id: checksum
+        run: |
+          set -euo pipefail
+          sha="$(sha256sum copilot.py | awk '{print $1}')"
+          echo "sha256=${sha}" >> "$GITHUB_OUTPUT"
+          echo "copilot.py  sha256=${sha}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: copilot.py
+          body: |
+            Install with Homebrew:
+
+            ```sh
+            brew install natikgadzhi/taps/copilot-cli
+            copilot-cli --version
+            ```
+
+            **copilot.py sha256:** `${{ steps.checksum.outputs.sha256 }}`
+
+      - name: Check out the Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: natikgadzhi/homebrew-taps
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Regenerate the formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.checksum.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cat > tap/Formula/copilot-cli.rb <<EOF
+          # typed: false
+          # frozen_string_literal: true
+
+          # This file is updated by the copilot-python release workflow. DO NOT EDIT.
+          class CopilotCli < Formula
+            desc "Personal CLI for Copilot Money: sync to SQLite, edit transactions, export"
+            homepage "https://github.com/natikgadzhi/copilot-python"
+            url "https://github.com/natikgadzhi/copilot-python/releases/download/v${VERSION}/copilot.py"
+            sha256 "${SHA256}"
+            version "${VERSION}"
+            license "MIT"
+
+            # copilot.py is a single PEP 723 uv script: deps are declared inline and
+            # resolved (and cached) by uv on first run, so there is no virtualenv to
+            # manage here — we just need uv on the box.
+            depends_on "uv"
+
+            def install
+              libexec.install "copilot.py"
+              (bin/"copilot-cli").write <<~SH
+                #!/bin/bash
+                exec "#{Formula["uv"].opt_bin}/uv" run --script "#{libexec}/copilot.py" "\$@"
+              SH
+              chmod 0755, bin/"copilot-cli"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/copilot-cli --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push the formula
+        run: |
+          set -euo pipefail
+          cd tap
+          if git diff --quiet -- Formula/copilot-cli.rb; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/copilot-cli.rb
+          git commit -m "Brew formula update for copilot-cli version v${{ steps.version.outputs.version }}"
+          git push origin HEAD:main

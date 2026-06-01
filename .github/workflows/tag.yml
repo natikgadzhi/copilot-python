@@ -1,0 +1,78 @@
+name: Tag release
+
+# Manual version bump + tag. Pick a bump level; this bumps __version__ in
+# copilot.py (the single source of truth), commits "Release vX.Y.Z" to main,
+# creates the matching tag, and kicks off the release build.
+#
+# Why dispatch release.yml explicitly instead of letting the tag push trigger
+# it: a tag pushed with the default GITHUB_TOKEN does NOT start other workflows
+# (GitHub blocks recursive triggers), so `on: push tags` in release.yml would
+# never fire. We push the tag, then dispatch release.yml on that tag ref.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump level"
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write # push the bump commit + tag
+  actions: write # dispatch release.yml
+
+jobs:
+  tag:
+    name: Bump version and tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: version
+        run: |
+          set -euo pipefail
+          current="$(grep -E '^__version__ = ' copilot.py | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')"
+          if [[ ! "${current}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not parse __version__ from copilot.py (got '${current}')." >&2
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<< "${current}"
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          next="${major}.${minor}.${patch}"
+          if git rev-parse "v${next}" >/dev/null 2>&1; then
+            echo "Tag v${next} already exists." >&2
+            exit 1
+          fi
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${current} -> ${next}"
+
+      - name: Bump, commit, and tag
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s/(^__version__ = \")[0-9]+\.[0-9]+\.[0-9]+(\")/\1${NEXT}\2/" copilot.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release v${NEXT}"
+          git tag -a "v${NEXT}" -m "Release v${NEXT}"
+          git push origin HEAD:main
+          git push origin "v${NEXT}"
+
+      - name: Trigger release for the new tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+        run: gh workflow run release.yml --field tag="v${NEXT}"
