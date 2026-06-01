@@ -41,7 +41,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # Columns owned by this tool, never overwritten by remote upserts. local_notes
 # and local_updated_at are hand-edited; the rest are bookkeeping for sync.
